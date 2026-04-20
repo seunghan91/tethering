@@ -1,8 +1,12 @@
 // M1+M2 spike: discover Xiaomi RNDIS interface, try to claim it.
-// Usage:  sudo ./target/release/tethering scan
-//         sudo ./target/release/tethering claim
+// M3:         RNDIS session handshake (INITIALIZE / SET filter / QUERY MAC).
+// Usage:  ./target/release/tethering scan
+//         ./target/release/tethering claim
+//         ./target/release/tethering init
 
-use anyhow::{anyhow, Context, Result};
+mod rndis;
+
+use anyhow::{anyhow, bail, Context, Result};
 use rusb::{Device, DeviceHandle, UsbContext};
 use std::time::Duration;
 
@@ -16,7 +20,8 @@ fn main() -> Result<()> {
     match cmd.as_str() {
         "scan" => cmd_scan(),
         "claim" => cmd_claim(),
-        other => Err(anyhow!("unknown command: {} (use: scan | claim)", other)),
+        "init" => cmd_init(),
+        other => Err(anyhow!("unknown command: {} (use: scan | claim | init)", other)),
     }
 }
 
@@ -96,6 +101,55 @@ fn cmd_claim() -> Result<()> {
     Err(anyhow!(
         "no RNDIS interface detected — is USB tethering toggled ON on the phone?"
     ))
+}
+
+fn cmd_init() -> Result<()> {
+    let ctx = rusb::Context::new()?;
+    for device in ctx.devices()?.iter() {
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
+        if !has_rndis_interface(&device) {
+            continue;
+        }
+        println!(
+            "target: {:04x}:{:04x}",
+            desc.vendor_id(),
+            desc.product_id()
+        );
+
+        let handle = device.open().context("open device")?;
+        handle.set_auto_detach_kernel_driver(true).ok();
+
+        let (ctrl_if, data_if, _ep_in, _ep_out) = find_rndis_endpoints(&device)?;
+        handle.claim_interface(ctrl_if).context("claim control IF")?;
+        handle.claim_interface(data_if).context("claim data IF")?;
+        println!("  ✔ claimed control IF #{} and data IF #{}", ctrl_if, data_if);
+
+        let mut session = rndis::Session::open(&handle, ctrl_if)?;
+        println!(
+            "  ✔ INITIALIZE ok — max_transfer_size = {} B",
+            session.max_transfer_size
+        );
+
+        session.set_oid(
+            rndis::OID_GEN_CURRENT_PACKET_FILTER,
+            &rndis::FILTER_NORMAL.to_le_bytes(),
+        )?;
+        println!(
+            "  ✔ SET OID_GEN_CURRENT_PACKET_FILTER = 0x{:08x}",
+            rndis::FILTER_NORMAL
+        );
+
+        let mac = session.query_oid(rndis::OID_802_3_PERMANENT_ADDRESS)?;
+        if mac.len() != 6 {
+            bail!("expected 6-byte MAC, got {} bytes: {:02x?}", mac.len(), mac);
+        }
+        println!("  ✔ QUERY OID_802_3_PERMANENT_ADDRESS → {}", rndis::format_mac(&mac));
+        println!("✅ RNDIS session ready");
+        return Ok(());
+    }
+    Err(anyhow!("no RNDIS device found"))
 }
 
 fn pretty_vendor_product<T: UsbContext>(

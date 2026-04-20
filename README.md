@@ -32,14 +32,30 @@
 
 ## Milestones
 
-- [ ] **M1 — Discovery**: Xiaomi USB 디바이스 enumerate, RNDIS interface descriptor 파싱
-- [ ] **M2 — Claim**: USB interface claim, endpoint 열기 (control/bulk in/bulk out)
-- [ ] **M3 — RNDIS init**: INITIALIZE_MSG → QUERY_OID → SET_PACKET_FILTER 핸드셰이크
+- [x] **M1 — Discovery**: Xiaomi USB 디바이스 enumerate, RNDIS interface descriptor 파싱
+- [x] **M2 — Claim**: USB interface claim, endpoint 열기 (control/bulk in/bulk out)
+- [x] **M3 — RNDIS init**: INITIALIZE / SET_FILTER / QUERY_MAC 핸드셰이크
 - [ ] **M4 — Packet I/O**: RNDIS DATA_MSG 프레이밍/디프레이밍, 덤프 확인
 - [ ] **M5 — utun bridge**: utun 생성, 양방향 패킷 포워딩
 - [ ] **M6 — DHCP**: DHCPDISCOVER/REQUEST, IP/gateway/DNS 획득
 - [ ] **M7 — System config**: `route add`, `/etc/resolv.conf` 갱신, 종료 시 복원
 - [ ] **M8 — Packaging**: launchd plist, `sudo tethering up/down` CLI
+
+## Verified on real hardware
+
+Xiaomi Redmi 14C (VID:PID `2717:ff88`) against macOS 26.4.1 / Apple Silicon:
+
+```
+$ ./target/release/tethering init
+target: 2717:ff88
+  ✔ claimed control IF #0 and data IF #1
+  ✔ INITIALIZE ok — max_transfer_size = 15800 B
+  ✔ SET OID_GEN_CURRENT_PACKET_FILTER = 0x0000000f
+  ✔ QUERY OID_802_3_PERMANENT_ADDRESS → 2a:01:af:63:c3:52
+✅ RNDIS session ready
+```
+
+No sudo. No entitlement. No kext. Pure userspace.
 
 ## References
 
