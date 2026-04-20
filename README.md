@@ -35,7 +35,7 @@
 - [x] **M1 — Discovery**: Xiaomi USB 디바이스 enumerate, RNDIS interface descriptor 파싱
 - [x] **M2 — Claim**: USB interface claim, endpoint 열기 (control/bulk in/bulk out)
 - [x] **M3 — RNDIS init**: INITIALIZE / SET_FILTER / QUERY_MAC 핸드셰이크
-- [~] **M4 — Packet I/O**: PACKET_MSG 프레이밍 완성. 데이터 플레인 침묵 원인 조사 중 — [investigation log](docs/INVESTIGATION-M4.md)
+- [🛑] **M4 — Packet I/O**: PACKET_MSG 프레이밍 완성. 데이터 플레인 **완전 무음** — 0 프레임 / 0 에러. macOS USB 서브시스템이 하위에서 bulk IN을 삼키는 것으로 추정(H1) vs HyperOS 펌웨어 게이트(H2). UTM Linux VM 대조 실험으로 결정 필요 — [investigation log](docs/INVESTIGATION-M4.md)
 - [ ] **M5 — utun bridge**: utun 생성, 양방향 패킷 포워딩
 - [ ] **M6 — DHCP**: DHCPDISCOVER/REQUEST, IP/gateway/DNS 획득
 - [ ] **M7 — System config**: `route add`, `/etc/resolv.conf` 갱신, 종료 시 복원

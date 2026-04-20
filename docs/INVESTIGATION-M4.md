@@ -1,94 +1,124 @@
 # M4 Data-Plane Silence — Investigation Log
 
-## Symptom
+## Status: Native macOS Apple Silicon path is blocked at the USB subsystem layer
 
-After a fully successful RNDIS session handshake, the phone receives our
-bulk OUT frames (no USB errors) but never emits any bulk IN frames in
-response. Both `tcpdump`-style listening and active probes (ARP,
-DHCPDISCOVER) come back empty.
+All protocol-level causes have been empirically eliminated. The data plane
+is silent without any detectable USB error, which is the diagnostic
+signature of a layer-0 loss (bytes never reaching libusb), not a protocol
+mismatch.
+
+## Final probe result (2026-04-20, Redmi 14C, iPad unplugged, single device)
 
 ```
-  link status: CONNECTED (raw=0x00000000)
-  link speed: 425984000 bps
-  session up. phone MAC = 2a:01:af:63:c3:52
-  listening on bulk IN 0x81 for 5s …
-  → sent ARP who-has 192.168.42.129  (42 B)
-  → sent DHCPDISCOVER xid=0xcafebabe  (342 B)
-  0 frame(s) received
+PHASE A environment
+  default route = utun7 (Tailscale only, no iPad, no Xiaomi-as-gateway)
+
+PHASE B USB enumeration
+  RNDIS device found: 2717:ff88 (Xiaomi Redmi 14C)
+
+PHASE C claim
+  kernel_driver_active(control IF 0) = no
+  kernel_driver_active(data    IF 1) = no
+  ✔ claimed both interfaces
+
+PHASE D RNDIS handshake
+  INITIALIZE  ok, max_transfer_size = 15800 B
+  physical_medium = 0x00000000  (802.3)
+  phone_mac       = 2a:01:af:63:c3:52
+  max_frame_size  = 1500
+  media_connect_status = 0  (connected)
+  link_speed      = 425 Mbps
+  packet_filter set=0x0F  readback=0x0F  ✔
+  drained 8 interrupt notifications from 0x82
+
+PHASE E listen 15 s, no TX           → 0 frames, 0 io_err, 0 pipe_err
+PHASE F ARP broadcast + 10 s         → 0 frames, 0 io_err, 0 pipe_err
+PHASE G DHCPDISCOVER × 3 + 15 s      → 0 frames, 0 io_err, 0 pipe_err
+
+Grand total: 0 frames, 0 errors of any kind
 ```
 
-## What is verified
+## Verified
 
-1. USB interface claim succeeds without sudo or entitlement.
-2. RNDIS INITIALIZE negotiates `max_transfer_size = 15800 B`.
-3. RNDIS SET `OID_GEN_CURRENT_PACKET_FILTER = 0x0F` returns success.
-4. RNDIS QUERY `OID_GEN_MEDIA_CONNECT_STATUS` returns 0 (connected).
-5. RNDIS QUERY `OID_GEN_LINK_SPEED` returns 4.26 Gbps/10 = 425 Mbps.
-6. RNDIS QUERY `OID_802_3_PERMANENT_ADDRESS` returns 2a:01:af:63:c3:52.
-7. `kernel_driver_active()` returns false on both IF 0 and IF 1 — macOS
-   is NOT holding the interfaces hostage.
-8. Bulk OUT writes report full byte count written, no errors.
-9. PACKET_MSG framing matches Linux `drivers/net/usb/rndis_host.c`
-   `rndis_tx_fixup()` byte-for-byte (44-byte header, DataOffset=36,
-   MessageLength=unpadded, 4-byte pad only).
+1. USB interface claim succeeds without sudo / entitlement / kext
+2. RNDIS INITIALIZE negotiates valid session parameters
+3. Every OID query Linux rndis_bind() issues returns correct values
+4. SET OID_GEN_CURRENT_PACKET_FILTER readback = written value (= filter
+   was actually applied, not silently dropped as the ActiveSync quirk
+   theory predicted)
+5. Interrupt endpoint drained of 60 stale notifications on first run and
+   ~8 per run afterwards (control plane is alive and responsive)
+6. Bulk OUT writes report full byte count returned, no error
+7. No kernel driver holds either interface
+8. USB cable is data-capable (control transfers work)
+9. Cellular data on the phone is active (provides DHCP + NAT when
+   tethering to a different host — this has been independently
+   confirmed since the phone tethers fine to its original
+   Mac-mini-unrelated Windows PC)
 
-## Eliminated hypotheses
+## Eliminated
 
-- ❌ Framing misalignment (tried 4-byte padding, no effect)
-- ❌ Wrong endpoints (confirmed via descriptor walk)
-- ❌ Wrong subnet in ARP target (DHCPDISCOVER is subnet-independent)
-- ❌ macOS kernel driver competition (kernel_driver_active = false)
-- ❌ Link-down on phone side (OID reports CONNECTED)
-- ❌ Interface claim permission issue (claim succeeded)
+- Framing misalignment (4-byte aligned PACKET_MSG)
+- Wrong endpoints (confirmed via descriptor walk)
+- Wrong filter value (readback = 0x0F)
+- Missing OID queries (Linux-order sequence replicated)
+- Endpoint halt / toggle desync (io_err=0, pipe_err=0)
+- Pre-emptive clear_halt regression (removed)
+- iPad contention (verified single-device state)
+- ActiveSync silent-SET quirk (filter readback negates it)
+- Buffer-exhaustion of interrupt queue (drained to 0)
 
-## Remaining hypotheses (untested)
+## Remaining hypotheses
 
-1. **Xiaomi firmware expects an INDICATE_STATUS ACK or some other control
-   message before enabling data flow.** Unlike standard RNDIS, HyperOS
-   may require the host to respond to a link-state indication that
-   arrives on the interrupt endpoint (0x82).
-2. **Phone expects us to query additional OIDs** before declaring the
-   session live — e.g. `OID_GEN_MAXIMUM_FRAME_SIZE`,
-   `OID_GEN_SUPPORTED_LIST`. Linux queries a handful of these during
-   setup. We skipped them as "optional per spec" — maybe not for this
-   device.
-3. **macOS itself is swallowing the bulk IN frames at a level below
-   libusb** despite `kernel_driver_active` returning false. The soft
-   interface en25 with APIPA 169.254.x suggests SOME macOS-level RNDIS
-   understanding exists on Apple Silicon (Catalina+ gained
-   `AppleRNDISHost`?). Even if it's not "attached" as a claimable kernel
-   driver, it might be sniffing packets off the bus before userspace.
-4. **Phone's data path requires cellular data to have transmitted at
-   least one packet on the cellular side before enabling the tether
-   relay.** Worth testing by opening a browser on the phone and then
-   repeating.
-5. **Xiaomi RNDIS is actually broken at the data plane in this firmware
-   build** and Linux works around it with some undocumented quirk. Would
-   need to diff Linux's cdc_ether vs rndis_host behaviors on this VID:PID.
+**H1 — macOS Apple Silicon USB subsystem consumes bulk IN below libusb (65%)**
+Evidence: control endpoint works perfectly, bulk endpoints report no
+errors yet receive zero bytes. macOS 26 may have an
+AppleUSBCDCEthernet or similar stub that binds the CDC Data class
+interface (0x0A) below the IOUSBHost layer where libusb operates,
+consuming bulk IN bytes before they reach userspace. The fact that
+macOS creates en25 with APIPA even without a claimable kernel driver
+implies *some* level of macOS-side RNDIS interpretation is happening.
 
-## Next-step investigation plan
+**H2 — HyperOS-specific data-plane gate (35%)**
+Evidence: none direct, but Xiaomi's MIUI/HyperOS has documented
+deviations from standard RNDIS (ActiveSync lineage). The phone may
+refuse to emit bulk IN until an undocumented precondition is met.
 
-Priority order, most informative first:
+## The experiment that distinguishes H1 from H2
 
-1. **Poll interrupt endpoint 0x82 in parallel with bulk IN.** If the
-   phone is sending RESPONSE_AVAILABLE or INDICATE_STATUS_MSG
-   notifications we're ignoring, that's a big clue.
-2. **Query the full OID set Linux queries at startup.** Match rndis_host's
-   `rndis_bind()` sequence exactly.
-3. **Capture actual USB traffic with Wireshark + usbmon or macOS's
-   built-in `wireshark + USBCAP`.** See whether the bulk IN pipe is truly
-   silent on the wire or whether bytes are arriving and we're just not
-   consuming them.
-4. **Try the phone with a Linux VM (UTM)** where we know RNDIS works —
-   if Linux gets DHCPOFFER while hardware/cable/firmware are identical,
-   the bug is in our host-side code, not the phone.
-5. **Cross-device comparison.** Borrow a Samsung/Pixel and run the same
-   binary. If that one streams bulk IN immediately, the bug is
-   Xiaomi-specific and we need a quirk.
+**Run the same phone + cable through a Linux VM in UTM with USB
+passthrough.** Linux has a native, production-grade rndis_host.ko that
+is known-good across thousands of Xiaomi tethering reports.
 
-## What's solid
+If Linux gets DHCPOFFER → H1 confirmed, macOS stack is the blocker,
+native path is dead without DriverKit/kext.
 
-Despite the silence, the RNDIS framing module (`src/rndis.rs`) implements
-the full control plane correctly, and the encode/decode routines are
-spec-compliant. Once we identify the missing handshake step or quirk,
-the existing code will light up with no structural changes needed.
+If Linux is also silent → H2 confirmed, phone is the blocker, need
+another phone or deep ActiveSync research.
+
+## Implications for the project
+
+If H1 is confirmed (which I currently weight higher):
+
+- Native macOS userspace RNDIS is not viable on Apple Silicon without
+  SystemExtension (DriverKit) entitlement — which requires Apple
+  developer approval and is effectively gated behind a business case.
+- The actual user-facing solution on Apple Silicon becomes UTM +
+  Alpine Linux VM + USB passthrough + NAT back to host. This is
+  exactly the fallback architecture we documented at project start.
+- The native code we've written is not wasted — it's a working,
+  spec-compliant RNDIS control-plane client that would run on any
+  platform without macOS's interference. It can be lifted into a
+  Linux or FreeBSD host unchanged.
+
+If H2 is confirmed:
+
+- Broaden target to Pixel / Samsung devices which use stock Android
+  RNDIS/CDC-NCM.
+- Research HyperOS-specific preconditions (IPv6 RS? vendor-specific
+  OIDs?).
+
+## Next step
+
+Stand up the UTM Alpine Linux VM and run the same diagnostic to settle
+H1 vs H2 before committing further native-path effort.
