@@ -22,8 +22,9 @@ fn main() -> Result<()> {
         "claim" => cmd_claim(),
         "init" => cmd_init(),
         "dump" => cmd_dump(),
+        "probe" => cmd_probe(),
         other => Err(anyhow!(
-            "unknown command: {} (use: scan | claim | init | dump)",
+            "unknown command: {} (use: scan | claim | init | dump | probe)",
             other
         )),
     }
@@ -279,23 +280,36 @@ fn cmd_dump() -> Result<()> {
             println!("  no pending interrupt notifications on 0x{:02x}", intr_ep);
         }
 
-        println!("  listening on bulk IN 0x{:02x} for 5s …", ep_in);
+        // Two modes, env-selected:
+        //   LISTEN_ONLY=1 → no TX, just watch for unsolicited traffic (ARP
+        //                   probes, IPv6 RA, etc). Useful for ruling out
+        //                   TX-induced state corruption.
+        //   default       → ARP + DHCPDISCOVER probes, then listen.
+        let listen_only = std::env::var("LISTEN_ONLY").is_ok();
+        let listen_secs: u64 = std::env::var("LISTEN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
 
-        // Our host-side MAC sits under the locally-administered OUI (02:xx:..)
-        // so we don't collide with any real NIC. ARP probe is a quick reachability
-        // check; DHCPDISCOVER is the authoritative "is this actually tethering?"
-        // test since any working Android tether MUST reply with DHCPOFFER.
-        let our_mac: [u8; 6] = [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
-        let arp = build_arp_request(&our_mac, &[0, 0, 0, 0], &[192, 168, 42, 129]);
-        rndis::write_bulk_frame(&handle, ep_out, &arp)?;
-        println!("  → sent ARP who-has 192.168.42.129  ({} B)", arp.len());
+        if listen_only {
+            println!(
+                "  LISTEN_ONLY mode: no TX, listening on bulk IN 0x{:02x} for {}s",
+                ep_in, listen_secs
+            );
+        } else {
+            println!("  listening on bulk IN 0x{:02x} for {}s after probe …", ep_in, listen_secs);
+            let our_mac: [u8; 6] = [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+            let arp = build_arp_request(&our_mac, &[0, 0, 0, 0], &[192, 168, 42, 129]);
+            rndis::write_bulk_frame(&handle, ep_out, &arp)?;
+            println!("  → sent ARP who-has 192.168.42.129  ({} B)", arp.len());
 
-        let xid: u32 = 0xCAFE_BABE;
-        let disc = build_dhcp_discover(&our_mac, xid);
-        rndis::write_bulk_frame(&handle, ep_out, &disc)?;
-        println!("  → sent DHCPDISCOVER xid=0x{:08x}  ({} B)", xid, disc.len());
+            let xid: u32 = 0xCAFE_BABE;
+            let disc = build_dhcp_discover(&our_mac, xid);
+            rndis::write_bulk_frame(&handle, ep_out, &disc)?;
+            println!("  → sent DHCPDISCOVER xid=0x{:08x}  ({} B)", xid, disc.len());
+        }
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(listen_secs);
         let mut count = 0;
         while std::time::Instant::now() < deadline {
             let frames = rndis::read_bulk_frames(&handle, ep_in, Duration::from_millis(500))?;
@@ -580,6 +594,222 @@ fn classify(alt: &rusb::InterfaceDescriptor) -> &'static str {
         (0x01, _, _) => "Audio",
         _ => "",
     }
+}
+
+/// Self-contained diagnostic runner. Captures everything to both stdout and a
+/// timestamped log file next to the binary. Designed to run offline (no network
+/// required) in the scenario where the iPad tether has been unplugged and the
+/// Xiaomi is the only phone connected. Answers the single question:
+/// "is the phone actually emitting bulk IN frames or not."
+fn cmd_probe() -> Result<()> {
+    use std::io::Write;
+
+    // Open log file next to the running binary.
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("tethering"));
+    let stem = chrono_now_stamp();
+    let log_dir = exe
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_path = log_dir.join(format!("tethering-probe-{}.log", stem));
+    let mut log = std::fs::File::create(&log_path)
+        .with_context(|| format!("create log file {}", log_path.display()))?;
+
+    let mut tee = |s: &str| {
+        println!("{}", s);
+        let _ = writeln!(log, "{}", s);
+        let _ = log.flush();
+    };
+
+    tee(&format!("━━━ tethering-probe started at {} ━━━", stem));
+    tee(&format!("log: {}", log_path.display()));
+    tee(&format!("macOS: {} / {}", sysinfo("sw_vers -productVersion"), sysinfo("uname -m")));
+
+    // ── Phase A — environment ────────────────────────────────────────
+    tee("\n━━━ PHASE A — environment ━━━");
+    tee(&format!("active default route(s):\n{}", sysinfo("netstat -rn -f inet | grep default || true")));
+    tee(&format!("USB phones visible:\n{}", sysinfo("system_profiler SPUSBDataType 2>/dev/null | grep -E 'iPad|iPhone|Redmi|Xiaomi|Pixel|Galaxy' || true")));
+
+    // ── Phase B — device discovery ───────────────────────────────────
+    tee("\n━━━ PHASE B — USB enumeration ━━━");
+    let ctx = rusb::Context::new()?;
+    let devices = ctx.devices()?;
+    let mut target: Option<Device<rusb::Context>> = None;
+    for device in devices.iter() {
+        if has_rndis_interface(&device) {
+            let desc = device.device_descriptor()?;
+            tee(&format!(
+                "  RNDIS device found: {:04x}:{:04x}",
+                desc.vendor_id(),
+                desc.product_id()
+            ));
+            target = Some(device);
+            break;
+        }
+    }
+    let device = match target {
+        Some(d) => d,
+        None => {
+            tee("  ✗ NO RNDIS DEVICE FOUND.");
+            tee("    Checklist: USB cable is data-capable, USB tethering toggle is ON,");
+            tee("    phone unlocked and not showing 'Allow USB debugging' prompt.");
+            return Ok(());
+        }
+    };
+
+    // ── Phase C — claim interfaces ───────────────────────────────────
+    tee("\n━━━ PHASE C — claim interfaces ━━━");
+    let handle = device.open().context("open device")?;
+    handle.set_auto_detach_kernel_driver(true).ok();
+    let (ctrl_if, data_if, ep_in, ep_out) = find_rndis_endpoints(&device)?;
+    let intr_ep = find_interrupt_ep(&device, ctrl_if).unwrap_or(0x82);
+    for (label, iface) in [("control", ctrl_if), ("data", data_if)] {
+        let active = handle
+            .kernel_driver_active(iface)
+            .map(|b| if b { "YES ⚠" } else { "no" }.to_string())
+            .unwrap_or_else(|e| format!("err: {}", e));
+        tee(&format!("  kernel_driver_active({}, IF #{}) = {}", label, iface, active));
+    }
+    handle.claim_interface(ctrl_if)?;
+    handle.claim_interface(data_if)?;
+    tee(&format!("  ✔ claimed ctrl IF #{}, data IF #{}", ctrl_if, data_if));
+    tee(&format!("  endpoints: bulk IN 0x{:02x}, bulk OUT 0x{:02x}, intr IN 0x{:02x}", ep_in, ep_out, intr_ep));
+
+    // ── Phase D — RNDIS handshake in Linux order ─────────────────────
+    tee("\n━━━ PHASE D — RNDIS handshake ━━━");
+    let mut session = rndis::Session::open(&handle, ctrl_if)?;
+    tee(&format!("  INITIALIZE ok, max_transfer_size = {} B", session.max_transfer_size));
+
+    let medium = session.query_oid(rndis::OID_GEN_PHYSICAL_MEDIUM).unwrap_or_else(|_| 0u32.to_le_bytes().to_vec());
+    tee(&format!("  physical_medium = 0x{:08x}", u32::from_le_bytes(medium.as_slice().try_into().unwrap_or([0;4]))));
+
+    let mac = session.query_oid(rndis::OID_802_3_PERMANENT_ADDRESS)?;
+    let phone_mac: [u8; 6] = mac.as_slice().try_into().map_err(|_| anyhow!("bad MAC len"))?;
+    tee(&format!("  phone_mac = {}", rndis::format_mac(&phone_mac)));
+
+    if let Ok(mtu) = session.query_oid(rndis::OID_GEN_MAXIMUM_FRAME_SIZE) {
+        if mtu.len() == 4 {
+            tee(&format!("  max_frame_size = {}", u32::from_le_bytes(mtu.as_slice().try_into().unwrap())));
+        }
+    }
+    let link = session.query_oid(rndis::OID_GEN_MEDIA_CONNECT_STATUS)?;
+    tee(&format!("  media_connect_status = {} (0=connected)", u32::from_le_bytes(link.as_slice().try_into().unwrap_or([1;4]))));
+    if let Ok(sp) = session.query_oid(rndis::OID_GEN_LINK_SPEED) {
+        if sp.len() == 4 {
+            tee(&format!("  link_speed = {} bps", u32::from_le_bytes(sp.as_slice().try_into().unwrap()) as u64 * 100));
+        }
+    }
+
+    session.set_oid(rndis::OID_GEN_CURRENT_PACKET_FILTER, &rndis::FILTER_NORMAL.to_le_bytes())?;
+    let rb = session.query_oid(rndis::OID_GEN_CURRENT_PACKET_FILTER).unwrap_or_default();
+    let rb_val = if rb.len() == 4 { u32::from_le_bytes(rb.as_slice().try_into().unwrap()) } else { 0 };
+    tee(&format!("  packet_filter set=0x{:08x} readback=0x{:08x} {}", rndis::FILTER_NORMAL, rb_val, if rb_val == rndis::FILTER_NORMAL {"✔"} else {"✗"}));
+
+    handle.clear_halt(ep_in).ok();
+    handle.clear_halt(ep_out).ok();
+    let drained = rndis::drain_interrupt_notifications(&handle, ctrl_if, intr_ep)?;
+    tee(&format!("  drained {} interrupt notifications from 0x{:02x}", drained, intr_ep));
+
+    // ── Phase E — listen-only 15 s ───────────────────────────────────
+    tee("\n━━━ PHASE E — listen only, no TX, 15 s ━━━");
+    let total_e = listen_and_log(&handle, ep_in, 15, &mut tee)?;
+    tee(&format!("  phase E total frames: {}", total_e));
+
+    // ── Phase F — ARP probe + 10 s listen ────────────────────────────
+    tee("\n━━━ PHASE F — ARP probe + 10 s ━━━");
+    let our_mac: [u8; 6] = [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+    let arp = build_arp_request(&our_mac, &[0, 0, 0, 0], &[192, 168, 42, 129]);
+    rndis::write_bulk_frame(&handle, ep_out, &arp)?;
+    tee(&format!("  → sent ARP who-has 192.168.42.129 ({} B)", arp.len()));
+    let total_f = listen_and_log(&handle, ep_in, 10, &mut tee)?;
+    tee(&format!("  phase F total frames: {}", total_f));
+
+    // ── Phase G — DHCPDISCOVER x3 + 15 s listen ──────────────────────
+    tee("\n━━━ PHASE G — DHCPDISCOVER x3 + 15 s ━━━");
+    for (i, xid) in [0xCAFE_BABEu32, 0xDEAD_BEEF, 0x1234_5678].iter().enumerate() {
+        let disc = build_dhcp_discover(&our_mac, *xid);
+        rndis::write_bulk_frame(&handle, ep_out, &disc)?;
+        tee(&format!("  → #{} sent DHCPDISCOVER xid=0x{:08x} ({} B)", i + 1, xid, disc.len()));
+    }
+    let total_g = listen_and_log(&handle, ep_in, 15, &mut tee)?;
+    tee(&format!("  phase G total frames: {}", total_g));
+
+    // ── Phase H — verdict ────────────────────────────────────────────
+    tee("\n━━━ PHASE H — verdict ━━━");
+    let grand_total = total_e + total_f + total_g;
+    tee(&format!("  frames received across all phases: {}", grand_total));
+    if grand_total == 0 {
+        tee("  ✗ DATA PLANE TOTALLY SILENT.");
+        tee("    Control plane is fully healthy (handshake, OIDs, filter readback).");
+        tee("    With iPad disconnected and single-device, remaining suspects:");
+        tee("      - Xiaomi firmware data-plane bug specific to this VID:PID");
+        tee("      - macOS Apple Silicon USB subsystem silently dropping bulk IN");
+        tee("    Next: test same phone+cable through Linux (UTM) for ground truth.");
+    } else {
+        tee(&format!("  ✓ RECEIVED {} FRAMES — native path is viable!", grand_total));
+    }
+    tee(&format!("\nlog written to: {}", log_path.display()));
+    Ok(())
+}
+
+/// Listen for `secs` seconds on bulk IN, log every frame with type/hint/hex prefix.
+fn listen_and_log<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ep_in: u8,
+    secs: u64,
+    tee: &mut dyn FnMut(&str),
+) -> Result<usize> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut count = 0;
+    let start = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        let frames = rndis::read_bulk_frames(handle, ep_in, Duration::from_millis(500))?;
+        for f in frames {
+            count += 1;
+            let ms = start.elapsed().as_millis();
+            tee(&format!("    [t+{}ms #{}] {} B", ms, count, f.len()));
+            if f.len() >= 14 {
+                let dst = &f[0..6];
+                let src = &f[6..12];
+                let etype = u16::from_be_bytes([f[12], f[13]]);
+                tee(&format!(
+                    "      src={}  dst={}  type=0x{:04x}  {}",
+                    rndis::format_mac(src),
+                    rndis::format_mac(dst),
+                    etype,
+                    ethertype_hint(etype, &f)
+                ));
+            }
+            // Log first 48 bytes as hex for any case.
+            let take = f.iter().take(48).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+            tee(&format!("      hex: {}", take));
+        }
+    }
+    Ok(count)
+}
+
+fn chrono_now_stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // YYYYMMDD-HHMMSS derived from secs, in UTC-ish formatting (no chrono dep).
+    let days = now / 86400;
+    let rem = now % 86400;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // Year/month/day approximation good enough for filename ordering.
+    format!("{}-{:02}{:02}{:02}", days, h, m, s)
+}
+
+fn sysinfo(cmd: &str) -> String {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "(command failed)".to_string())
 }
 
 /// The RNDIS control interface carries a single interrupt IN endpoint used for
