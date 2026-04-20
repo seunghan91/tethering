@@ -360,6 +360,89 @@ pub fn read_bulk_frames<T: UsbContext>(
     }
 }
 
+// ── Interrupt endpoint notification drain ───────────────────────────
+//
+// MS-RNDIS §2.1.2.1: the device posts an 8-byte RESPONSE_AVAILABLE
+// notification on the interrupt IN endpoint whenever it has a control
+// response ready. Format:
+//   bytes 0..4  : 0x00000001  (RESPONSE_AVAILABLE)
+//   bytes 4..8  : 0x00000000  (reserved)
+//
+// The spec warns that a device may buffer-exhaust and stop responding on
+// bulk IN if the host ignores these notifications for too long. That
+// matches our Redmi 14C symptom. Drain any pending notifications once,
+// then consume the paired encapsulated response via the control pipe.
+// Returns the number of notifications actually drained.
+
+const NOTIFY_RESPONSE_AVAILABLE: u32 = 0x0000_0001;
+
+pub fn drain_interrupt_notifications<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ctrl_iface: u8,
+    intr_ep: u8,
+) -> Result<usize> {
+    let mut buf = [0u8; 8];
+    let mut drained = 0;
+    loop {
+        match handle.read_interrupt(intr_ep, &mut buf, Duration::from_millis(100)) {
+            Ok(n) if n >= 4 => {
+                let ty = u32_at(&buf[..n], 0);
+                if ty == NOTIFY_RESPONSE_AVAILABLE {
+                    // Consume the paired response from control pipe.
+                    let mut rsp = [0u8; 1024];
+                    let got = handle.read_control(
+                        0xA1,
+                        REQ_GET_ENCAPSULATED_RESPONSE,
+                        0,
+                        ctrl_iface as u16,
+                        &mut rsp,
+                        Duration::from_millis(200),
+                    );
+                    match got {
+                        Ok(n) if n >= 4 => {
+                            let msg_type = u32_at(&rsp[..n], 0);
+                            let label = match msg_type {
+                                0x8000_0002 => "INITIALIZE_CMPLT",
+                                0x8000_0004 => "QUERY_CMPLT",
+                                0x8000_0005 => "SET_CMPLT",
+                                0x0000_0007 => "INDICATE_STATUS",
+                                _ => "?",
+                            };
+                            if drained < 3 {
+                                println!(
+                                    "    ⇠ drained [{}] {} B  type=0x{:08x}  {}",
+                                    drained + 1,
+                                    n,
+                                    msg_type,
+                                    label
+                                );
+                            }
+                        }
+                        Ok(n) => {
+                            if drained < 3 {
+                                println!("    ⇠ drained [{}] {} B (short)", drained + 1, n);
+                            }
+                        }
+                        Err(e) => {
+                            if drained < 3 {
+                                println!("    ⇠ drained [{}] notif but no response ({})", drained + 1, e);
+                            }
+                        }
+                    }
+                    drained += 1;
+                } else {
+                    eprintln!("    ⇠ unknown interrupt notification type=0x{:08x}", ty);
+                    drained += 1;
+                }
+            }
+            Ok(_) => break,
+            Err(rusb::Error::Timeout) => break,
+            Err(e) => return Err(anyhow!("interrupt read failed: {}", e)),
+        }
+    }
+    Ok(drained)
+}
+
 pub fn write_bulk_frame<T: UsbContext>(
     handle: &DeviceHandle<T>,
     ep_out: u8,

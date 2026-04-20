@@ -175,6 +175,7 @@ fn cmd_dump() -> Result<()> {
         handle.set_auto_detach_kernel_driver(true).ok();
 
         let (ctrl_if, data_if, ep_in, ep_out) = find_rndis_endpoints(&device)?;
+        let intr_ep = find_interrupt_ep(&device, ctrl_if).unwrap_or(0x82);
 
         // Diagnostic: is macOS already holding on to these interfaces?
         for (label, iface) in [("control", ctrl_if), ("data", data_if)] {
@@ -243,15 +244,40 @@ fn cmd_dump() -> Result<()> {
             rndis::OID_GEN_CURRENT_PACKET_FILTER,
             &rndis::FILTER_NORMAL.to_le_bytes(),
         )?;
-        println!("  ✔ packet filter = 0x{:08x} (data plane open)", rndis::FILTER_NORMAL);
 
-        // Some non-Linux RNDIS gadgets stall the bulk endpoints when they see
-        // SET_ETHERNET_PACKET_FILTER. SET_CMPLT returns success but the endpoint
-        // is left halted and later bulk transfers silently drop. Issue a
-        // CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints to recover.
-        // Free if it's not needed; critical if it is.
+        // Verify the SET actually took by reading the filter back. On a broken
+        // ActiveSync RNDIS firmware the SET may return CMPLT{SUCCESS} while the
+        // device silently ignores the new value. If readback returns 0, the
+        // data plane is still gated even though we think we opened it.
+        let readback = session
+            .query_oid(rndis::OID_GEN_CURRENT_PACKET_FILTER)
+            .unwrap_or_default();
+        let readback_val = if readback.len() == 4 {
+            u32::from_le_bytes(readback.as_slice().try_into().unwrap())
+        } else {
+            0
+        };
+        let check = if readback_val == rndis::FILTER_NORMAL { "✔" } else { "✗" };
+        println!(
+            "  {} packet filter SET=0x{:08x}, readback=0x{:08x}",
+            check, rndis::FILTER_NORMAL, readback_val
+        );
+
+        // Clear any lingering endpoint halt state left behind by SET_FILTER
+        // quirks seen on non-Linux RNDIS gadgets. Free if unnecessary.
         handle.clear_halt(ep_in).ok();
         handle.clear_halt(ep_out).ok();
+
+        // Drain pending RESPONSE_AVAILABLE notifications on the interrupt IN
+        // endpoint. MS-RNDIS warns that devices may buffer-exhaust and freeze
+        // the data plane if these aren't consumed. We drain once here, then
+        // spawn a background thread that drains continuously during the listen.
+        let drained = rndis::drain_interrupt_notifications(&handle, ctrl_if, intr_ep)?;
+        if drained > 0 {
+            println!("  drained {} pending interrupt notification(s) on 0x{:02x}", drained, intr_ep);
+        } else {
+            println!("  no pending interrupt notifications on 0x{:02x}", intr_ep);
+        }
 
         println!("  listening on bulk IN 0x{:02x} for 5s …", ep_in);
 
@@ -554,6 +580,29 @@ fn classify(alt: &rusb::InterfaceDescriptor) -> &'static str {
         (0x01, _, _) => "Audio",
         _ => "",
     }
+}
+
+/// The RNDIS control interface carries a single interrupt IN endpoint used for
+/// RESPONSE_AVAILABLE notifications (MS-RNDIS §2.1.2.1). Usually 0x82 but look
+/// it up rather than hardcoding.
+fn find_interrupt_ep<T: UsbContext>(device: &Device<T>, ctrl_if: u8) -> Option<u8> {
+    let desc = device.device_descriptor().ok()?;
+    for i in 0..desc.num_configurations() {
+        let cfg = device.config_descriptor(i).ok()?;
+        for iface in cfg.interfaces() {
+            for alt in iface.descriptors() {
+                if alt.interface_number() != ctrl_if {
+                    continue;
+                }
+                for ep in alt.endpoint_descriptors() {
+                    if ep.transfer_type() == rusb::TransferType::Interrupt && ep.address() & 0x80 != 0 {
+                        return Some(ep.address());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn find_rndis_endpoints<T: UsbContext>(
