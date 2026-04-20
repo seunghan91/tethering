@@ -16,7 +16,9 @@ const RNDIS_CONTROL_PROTOCOL: u8 = 0x03;
 const RNDIS_DATA_CLASS: u8 = 0x0A;
 
 fn main() -> Result<()> {
-    let cmd = std::env::args().nth(1).unwrap_or_else(|| "scan".into());
+    // Default to `probe` so double-clicking the binary in Finder does the
+    // useful thing (run the full diagnostic) rather than a bare enumeration.
+    let cmd = std::env::args().nth(1).unwrap_or_else(|| "probe".into());
     match cmd.as_str() {
         "scan" => cmd_scan(),
         "claim" => cmd_claim(),
