@@ -195,6 +195,38 @@ fn cmd_dump() -> Result<()> {
 
         let mut session = rndis::Session::open(&handle, ctrl_if)?;
 
+        // Replicate the exact query+set sequence that Linux rndis_bind() does,
+        // in the same order. Empirically, HyperOS/MIUI RNDIS is picky enough
+        // that skipping any of these may leave the data plane gated.
+        //
+        //   1. QUERY OID_GEN_PHYSICAL_MEDIUM   — must be 802.3 (value 0)
+        //   2. QUERY OID_802_3_PERMANENT_ADDRESS
+        //   3. QUERY OID_GEN_MAXIMUM_FRAME_SIZE
+        //   4. QUERY OID_GEN_MEDIA_CONNECT_STATUS / LINK_SPEED (diagnostics)
+        //   5. SET   OID_GEN_CURRENT_PACKET_FILTER = 0x0F  (LAST — opens data)
+
+        let medium = session
+            .query_oid(rndis::OID_GEN_PHYSICAL_MEDIUM)
+            .unwrap_or_else(|_| 0u32.to_le_bytes().to_vec()); // old RNDIS may omit
+        let medium_val = u32::from_le_bytes(medium.as_slice().try_into().unwrap_or([0; 4]));
+        println!("  physical medium = 0x{:08x} (0 = 802.3)", medium_val);
+
+        let phone_mac_vec = session.query_oid(rndis::OID_802_3_PERMANENT_ADDRESS)?;
+        let phone_mac: [u8; 6] = phone_mac_vec
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("bad MAC length"))?;
+        println!("  phone MAC = {}", rndis::format_mac(&phone_mac));
+
+        if let Ok(mtu) = session.query_oid(rndis::OID_GEN_MAXIMUM_FRAME_SIZE) {
+            if mtu.len() == 4 {
+                println!(
+                    "  max frame size = {} B",
+                    u32::from_le_bytes(mtu.as_slice().try_into().unwrap())
+                );
+            }
+        }
+
         let link = session.query_oid(rndis::OID_GEN_MEDIA_CONNECT_STATUS)?;
         let link_val = u32::from_le_bytes(link.as_slice().try_into().unwrap_or([0; 4]));
         let link_str = if link_val == 0 { "CONNECTED" } else { "DISCONNECTED" };
@@ -206,17 +238,21 @@ fn cmd_dump() -> Result<()> {
             println!("  link speed: {} bps", bps);
         }
 
+        // SET goes LAST — this is what flips the device into RNDIS_DATA_INITIALIZED.
         session.set_oid(
             rndis::OID_GEN_CURRENT_PACKET_FILTER,
             &rndis::FILTER_NORMAL.to_le_bytes(),
         )?;
-        let phone_mac_vec = session.query_oid(rndis::OID_802_3_PERMANENT_ADDRESS)?;
-        let phone_mac: [u8; 6] = phone_mac_vec
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("bad MAC length"))?;
+        println!("  ✔ packet filter = 0x{:08x} (data plane open)", rndis::FILTER_NORMAL);
 
-        println!("  session up. phone MAC = {}", rndis::format_mac(&phone_mac));
+        // Some non-Linux RNDIS gadgets stall the bulk endpoints when they see
+        // SET_ETHERNET_PACKET_FILTER. SET_CMPLT returns success but the endpoint
+        // is left halted and later bulk transfers silently drop. Issue a
+        // CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints to recover.
+        // Free if it's not needed; critical if it is.
+        handle.clear_halt(ep_in).ok();
+        handle.clear_halt(ep_out).ok();
+
         println!("  listening on bulk IN 0x{:02x} for 5s …", ep_in);
 
         // Our host-side MAC sits under the locally-administered OUI (02:xx:..)

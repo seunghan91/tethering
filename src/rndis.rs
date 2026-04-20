@@ -24,9 +24,13 @@ const MSG_SET_CMPLT: u32 = 0x8000_0005;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 
 // ── OIDs we speak ───────────────────────────────────────────────────
+pub const OID_GEN_SUPPORTED_LIST: u32 = 0x0001_0101;
+pub const OID_GEN_MAXIMUM_FRAME_SIZE: u32 = 0x0001_0106;
+pub const OID_GEN_LINK_SPEED: u32 = 0x0001_0107; // in 100 bps units
+pub const OID_GEN_MAXIMUM_TOTAL_SIZE: u32 = 0x0001_010B;
 pub const OID_GEN_CURRENT_PACKET_FILTER: u32 = 0x0001_010E;
 pub const OID_GEN_MEDIA_CONNECT_STATUS: u32 = 0x0001_0114; // 0=connected, 1=disconnected
-pub const OID_GEN_LINK_SPEED: u32 = 0x0001_0107; // in 100 bps units
+pub const OID_GEN_PHYSICAL_MEDIUM: u32 = 0x0001_0202;
 pub const OID_802_3_PERMANENT_ADDRESS: u32 = 0x0101_0101;
 
 // ── Packet filter bit flags (OID_GEN_CURRENT_PACKET_FILTER) ─────────
