@@ -357,13 +357,15 @@ pub fn read_bulk_frames<T: UsbContext>(
         Ok(_) => Ok(Vec::new()),
         Err(rusb::Error::Timeout) => Ok(Vec::new()),
         // Device-reported stall / I/O error: try to recover by clearing
-        // the endpoint halt condition, then resume. The first bulk read on
-        // a freshly-opened RNDIS session sometimes surfaces an IO error
-        // because the endpoint's toggle state is out of sync with the
-        // device; clear_halt resets that.
-        Err(rusb::Error::Io) | Err(rusb::Error::Pipe) => {
+        // the endpoint halt condition, then resume. Bubble the kind up so
+        // callers can log it rather than silently eating a storm of errors.
+        Err(rusb::Error::Io) => {
             let _ = handle.clear_halt(ep_in);
-            Ok(Vec::new())
+            Err(anyhow!("bulk IN IO error (cleared halt)"))
+        }
+        Err(rusb::Error::Pipe) => {
+            let _ = handle.clear_halt(ep_in);
+            Err(anyhow!("bulk IN PIPE stall (cleared halt)"))
         }
         Err(e) => Err(anyhow!("bulk IN read failed: {}", e)),
     }

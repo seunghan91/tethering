@@ -763,6 +763,8 @@ fn cmd_probe() -> Result<()> {
 }
 
 /// Listen for `secs` seconds on bulk IN, log every frame with type/hint/hex prefix.
+/// Emits heartbeat lines so the user knows the process is alive, and surfaces
+/// bulk IN error kinds (IO / Pipe / other) with counts rather than swallowing them.
 fn listen_and_log<T: UsbContext>(
     handle: &DeviceHandle<T>,
     ep_in: u8,
@@ -770,30 +772,59 @@ fn listen_and_log<T: UsbContext>(
     tee: &mut dyn FnMut(&str),
 ) -> Result<usize> {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
-    let mut count = 0;
     let start = std::time::Instant::now();
+    let mut count = 0usize;
+    let mut io_errs = 0usize;
+    let mut pipe_errs = 0usize;
+    let mut last_heartbeat = start;
+
     while std::time::Instant::now() < deadline {
-        let frames = rndis::read_bulk_frames(handle, ep_in, Duration::from_millis(500))?;
-        for f in frames {
-            count += 1;
-            let ms = start.elapsed().as_millis();
-            tee(&format!("    [t+{}ms #{}] {} B", ms, count, f.len()));
-            if f.len() >= 14 {
-                let dst = &f[0..6];
-                let src = &f[6..12];
-                let etype = u16::from_be_bytes([f[12], f[13]]);
-                tee(&format!(
-                    "      src={}  dst={}  type=0x{:04x}  {}",
-                    rndis::format_mac(src),
-                    rndis::format_mac(dst),
-                    etype,
-                    ethertype_hint(etype, &f)
-                ));
+        match rndis::read_bulk_frames(handle, ep_in, Duration::from_millis(500)) {
+            Ok(frames) => {
+                for f in frames {
+                    count += 1;
+                    let ms = start.elapsed().as_millis();
+                    tee(&format!("    [t+{}ms #{}] {} B", ms, count, f.len()));
+                    if f.len() >= 14 {
+                        let dst = &f[0..6];
+                        let src = &f[6..12];
+                        let etype = u16::from_be_bytes([f[12], f[13]]);
+                        tee(&format!(
+                            "      src={}  dst={}  type=0x{:04x}  {}",
+                            rndis::format_mac(src),
+                            rndis::format_mac(dst),
+                            etype,
+                            ethertype_hint(etype, &f)
+                        ));
+                    }
+                    let take = f.iter().take(48).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    tee(&format!("      hex: {}", take));
+                }
             }
-            // Log first 48 bytes as hex for any case.
-            let take = f.iter().take(48).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-            tee(&format!("      hex: {}", take));
+            Err(e) => {
+                let s = format!("{}", e);
+                if s.contains("IO") {
+                    io_errs += 1;
+                } else if s.contains("PIPE") {
+                    pipe_errs += 1;
+                } else {
+                    tee(&format!("    bulk read error: {}", e));
+                }
+            }
         }
+
+        // Heartbeat every 3 s so the terminal doesn't look frozen.
+        if last_heartbeat.elapsed() >= Duration::from_secs(3) {
+            let elapsed = start.elapsed().as_secs();
+            tee(&format!(
+                "    … t+{}s  frames={}  io_err={}  pipe_err={}",
+                elapsed, count, io_errs, pipe_errs
+            ));
+            last_heartbeat = std::time::Instant::now();
+        }
+    }
+    if io_errs + pipe_errs > 0 {
+        tee(&format!("    totals: frames={}  io_errs={}  pipe_errs={}", count, io_errs, pipe_errs));
     }
     Ok(count)
 }
