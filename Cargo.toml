@@ -1,0 +1,13 @@
+[package]
+name = "tethering"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+rusb = "0.9"
+anyhow = "1"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
