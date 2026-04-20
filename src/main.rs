@@ -21,7 +21,11 @@ fn main() -> Result<()> {
         "scan" => cmd_scan(),
         "claim" => cmd_claim(),
         "init" => cmd_init(),
-        other => Err(anyhow!("unknown command: {} (use: scan | claim | init)", other)),
+        "dump" => cmd_dump(),
+        other => Err(anyhow!(
+            "unknown command: {} (use: scan | claim | init | dump)",
+            other
+        )),
     }
 }
 
@@ -150,6 +154,264 @@ fn cmd_init() -> Result<()> {
         return Ok(());
     }
     Err(anyhow!("no RNDIS device found"))
+}
+
+fn cmd_dump() -> Result<()> {
+    let ctx = rusb::Context::new()?;
+    for device in ctx.devices()?.iter() {
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
+        if !has_rndis_interface(&device) {
+            continue;
+        }
+        println!(
+            "target: {:04x}:{:04x}",
+            desc.vendor_id(),
+            desc.product_id()
+        );
+
+        let handle = device.open().context("open device")?;
+        handle.set_auto_detach_kernel_driver(true).ok();
+
+        let (ctrl_if, data_if, ep_in, ep_out) = find_rndis_endpoints(&device)?;
+
+        // Diagnostic: is macOS already holding on to these interfaces?
+        for (label, iface) in [("control", ctrl_if), ("data", data_if)] {
+            match handle.kernel_driver_active(iface) {
+                Ok(true) => println!("  ⚠  kernel driver attached to {} IF #{}", label, iface),
+                Ok(false) => println!("  kernel driver NOT attached to {} IF #{}", label, iface),
+                Err(e) => println!("  kernel driver check failed on IF #{}: {}", iface, e),
+            }
+        }
+
+        handle.claim_interface(ctrl_if)?;
+        handle.claim_interface(data_if)?;
+
+        // Clear halt on the bulk endpoints — some phones leave them stalled
+        // if a previous session aborted mid-transfer.
+        handle.clear_halt(ep_in).ok();
+        handle.clear_halt(ep_out).ok();
+
+        let mut session = rndis::Session::open(&handle, ctrl_if)?;
+
+        let link = session.query_oid(rndis::OID_GEN_MEDIA_CONNECT_STATUS)?;
+        let link_val = u32::from_le_bytes(link.as_slice().try_into().unwrap_or([0; 4]));
+        let link_str = if link_val == 0 { "CONNECTED" } else { "DISCONNECTED" };
+        println!("  link status: {} (raw=0x{:08x})", link_str, link_val);
+
+        let speed = session.query_oid(rndis::OID_GEN_LINK_SPEED).unwrap_or_default();
+        if speed.len() == 4 {
+            let bps = u32::from_le_bytes(speed.as_slice().try_into().unwrap()) as u64 * 100;
+            println!("  link speed: {} bps", bps);
+        }
+
+        session.set_oid(
+            rndis::OID_GEN_CURRENT_PACKET_FILTER,
+            &rndis::FILTER_NORMAL.to_le_bytes(),
+        )?;
+        let phone_mac_vec = session.query_oid(rndis::OID_802_3_PERMANENT_ADDRESS)?;
+        let phone_mac: [u8; 6] = phone_mac_vec
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("bad MAC length"))?;
+
+        println!("  session up. phone MAC = {}", rndis::format_mac(&phone_mac));
+        println!("  listening on bulk IN 0x{:02x} for 5s …", ep_in);
+
+        // Our host-side MAC sits under the locally-administered OUI (02:xx:..)
+        // so we don't collide with any real NIC. ARP probe is a quick reachability
+        // check; DHCPDISCOVER is the authoritative "is this actually tethering?"
+        // test since any working Android tether MUST reply with DHCPOFFER.
+        let our_mac: [u8; 6] = [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let arp = build_arp_request(&our_mac, &[0, 0, 0, 0], &[192, 168, 42, 129]);
+        rndis::write_bulk_frame(&handle, ep_out, &arp)?;
+        println!("  → sent ARP who-has 192.168.42.129  ({} B)", arp.len());
+
+        let xid: u32 = 0xCAFE_BABE;
+        let disc = build_dhcp_discover(&our_mac, xid);
+        rndis::write_bulk_frame(&handle, ep_out, &disc)?;
+        println!("  → sent DHCPDISCOVER xid=0x{:08x}  ({} B)", xid, disc.len());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut count = 0;
+        while std::time::Instant::now() < deadline {
+            let frames = rndis::read_bulk_frames(&handle, ep_in, Duration::from_millis(500))?;
+            for f in frames {
+                count += 1;
+                print_ethernet(count, &f);
+            }
+        }
+        println!("  {} frame(s) received", count);
+        return Ok(());
+    }
+    Err(anyhow!("no RNDIS device found"))
+}
+
+/// Craft a 42-byte ethernet+ARP request frame. Ethertype 0x0806, opcode 1.
+fn build_arp_request(sender_mac: &[u8; 6], sender_ip: &[u8; 4], target_ip: &[u8; 4]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(42);
+    // Ethernet header (14 B)
+    f.extend_from_slice(&[0xFF; 6]); // dst: broadcast
+    f.extend_from_slice(sender_mac); // src
+    f.extend_from_slice(&[0x08, 0x06]); // ethertype = ARP
+    // ARP payload (28 B)
+    f.extend_from_slice(&[0x00, 0x01]); // htype = ethernet
+    f.extend_from_slice(&[0x08, 0x00]); // ptype = IPv4
+    f.push(6); // hlen
+    f.push(4); // plen
+    f.extend_from_slice(&[0x00, 0x01]); // opcode = request
+    f.extend_from_slice(sender_mac);
+    f.extend_from_slice(sender_ip);
+    f.extend_from_slice(&[0x00; 6]); // target mac unknown
+    f.extend_from_slice(target_ip);
+    f
+}
+
+/// Craft a 342-byte ethernet+IPv4+UDP+DHCPDISCOVER broadcast frame.
+///
+/// This is the canonical "wake up, DHCP server" message. Any working Android
+/// USB tether runs a DHCP server that MUST reply to this. Using it as our
+/// probe avoids guessing the phone's chosen subnet.
+fn build_dhcp_discover(sender_mac: &[u8; 6], xid: u32) -> Vec<u8> {
+    // DHCP payload (300 B minimum per RFC 951/2131 BOOTP framing).
+    let mut dhcp = Vec::with_capacity(300);
+    dhcp.push(1);                    // op: BOOTREQUEST
+    dhcp.push(1);                    // htype: Ethernet
+    dhcp.push(6);                    // hlen
+    dhcp.push(0);                    // hops
+    dhcp.extend_from_slice(&xid.to_be_bytes()); // xid
+    dhcp.extend_from_slice(&[0, 0]); // secs
+    dhcp.extend_from_slice(&[0x80, 0x00]); // flags: broadcast
+    dhcp.extend_from_slice(&[0; 4]); // ciaddr
+    dhcp.extend_from_slice(&[0; 4]); // yiaddr
+    dhcp.extend_from_slice(&[0; 4]); // siaddr
+    dhcp.extend_from_slice(&[0; 4]); // giaddr
+    dhcp.extend_from_slice(sender_mac);
+    dhcp.extend_from_slice(&[0; 10]); // chaddr padding (16 - 6)
+    dhcp.extend_from_slice(&[0; 64]); // sname
+    dhcp.extend_from_slice(&[0; 128]); // file
+    dhcp.extend_from_slice(&[99, 130, 83, 99]); // magic cookie
+    // Options
+    dhcp.extend_from_slice(&[53, 1, 1]); // DHCP Message Type = DISCOVER
+    dhcp.extend_from_slice(&[55, 4, 1, 3, 6, 15]); // Parameter Request List
+    dhcp.push(255); // end
+    while dhcp.len() < 300 {
+        dhcp.push(0);
+    }
+
+    // UDP header (8 B): sport=68, dport=67, len=308, checksum=0 (optional for IPv4)
+    let udp_len: u16 = 8 + dhcp.len() as u16;
+    let mut udp = Vec::with_capacity(udp_len as usize);
+    udp.extend_from_slice(&68u16.to_be_bytes());
+    udp.extend_from_slice(&67u16.to_be_bytes());
+    udp.extend_from_slice(&udp_len.to_be_bytes());
+    udp.extend_from_slice(&[0, 0]); // checksum
+    udp.extend_from_slice(&dhcp);
+
+    // IPv4 header (20 B)
+    let ip_total: u16 = 20 + udp.len() as u16;
+    let mut ip = Vec::with_capacity(20);
+    ip.push(0x45); // version=4, IHL=5
+    ip.push(0); // DSCP/ECN
+    ip.extend_from_slice(&ip_total.to_be_bytes());
+    ip.extend_from_slice(&[0, 0]); // identification
+    ip.extend_from_slice(&[0, 0]); // flags/fragment
+    ip.push(64); // TTL
+    ip.push(17); // protocol = UDP
+    ip.extend_from_slice(&[0, 0]); // checksum placeholder
+    ip.extend_from_slice(&[0, 0, 0, 0]); // src 0.0.0.0
+    ip.extend_from_slice(&[255, 255, 255, 255]); // dst broadcast
+    let cksum = ipv4_checksum(&ip);
+    ip[10] = (cksum >> 8) as u8;
+    ip[11] = cksum as u8;
+
+    // Ethernet (14 B)
+    let mut eth = Vec::with_capacity(14 + ip.len() + udp.len());
+    eth.extend_from_slice(&[0xFF; 6]);
+    eth.extend_from_slice(sender_mac);
+    eth.extend_from_slice(&[0x08, 0x00]);
+    eth.extend_from_slice(&ip);
+    eth.extend_from_slice(&udp);
+    eth
+}
+
+fn ipv4_checksum(hdr: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for pair in hdr.chunks(2) {
+        let word = if pair.len() == 2 {
+            u16::from_be_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], 0])
+        };
+        sum += word as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn print_ethernet(idx: usize, frame: &[u8]) {
+    if frame.len() < 14 {
+        println!("  [{idx:>3}] runt frame, {} B", frame.len());
+        return;
+    }
+    let dst = &frame[0..6];
+    let src = &frame[6..12];
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let kind = match ethertype {
+        0x0800 => "IPv4",
+        0x0806 => "ARP ",
+        0x86DD => "IPv6",
+        0x8100 => "VLAN",
+        _ => "?   ",
+    };
+    println!(
+        "  [{:>3}] {}  {} → {}  type=0x{:04x} {}  len={}",
+        idx,
+        kind,
+        rndis::format_mac(src),
+        rndis::format_mac(dst),
+        ethertype,
+        ethertype_hint(ethertype, frame),
+        frame.len()
+    );
+}
+
+fn ethertype_hint(etype: u16, frame: &[u8]) -> String {
+    match etype {
+        0x0806 if frame.len() >= 42 => {
+            let opcode = u16::from_be_bytes([frame[20], frame[21]]);
+            let sip = &frame[28..32];
+            let tip = &frame[38..42];
+            let verb = match opcode {
+                1 => "request",
+                2 => "reply  ",
+                _ => "?      ",
+            };
+            format!(
+                "[{} {}.{}.{}.{} → {}.{}.{}.{}]",
+                verb, sip[0], sip[1], sip[2], sip[3], tip[0], tip[1], tip[2], tip[3]
+            )
+        }
+        0x0800 if frame.len() >= 34 => {
+            let sip = &frame[26..30];
+            let dip = &frame[30..34];
+            let proto = frame[23];
+            let p = match proto {
+                1 => "icmp",
+                6 => "tcp ",
+                17 => "udp ",
+                _ => "?   ",
+            };
+            format!(
+                "[{} {}.{}.{}.{} → {}.{}.{}.{}]",
+                p, sip[0], sip[1], sip[2], sip[3], dip[0], dip[1], dip[2], dip[3]
+            )
+        }
+        _ => String::new(),
+    }
 }
 
 fn pretty_vendor_product<T: UsbContext>(

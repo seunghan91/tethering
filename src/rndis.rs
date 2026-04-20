@@ -13,6 +13,7 @@ use rusb::{DeviceHandle, UsbContext};
 use std::time::Duration;
 
 // ── Message type codes ──────────────────────────────────────────────
+const MSG_PACKET: u32 = 0x0000_0001;
 const MSG_INITIALIZE: u32 = 0x0000_0002;
 const MSG_INITIALIZE_CMPLT: u32 = 0x8000_0002;
 const MSG_QUERY: u32 = 0x0000_0004;
@@ -24,6 +25,8 @@ const STATUS_SUCCESS: u32 = 0x0000_0000;
 
 // ── OIDs we speak ───────────────────────────────────────────────────
 pub const OID_GEN_CURRENT_PACKET_FILTER: u32 = 0x0001_010E;
+pub const OID_GEN_MEDIA_CONNECT_STATUS: u32 = 0x0001_0114; // 0=connected, 1=disconnected
+pub const OID_GEN_LINK_SPEED: u32 = 0x0001_0107; // in 100 bps units
 pub const OID_802_3_PERMANENT_ADDRESS: u32 = 0x0101_0101;
 
 // ── Packet filter bit flags (OID_GEN_CURRENT_PACKET_FILTER) ─────────
@@ -241,6 +244,131 @@ impl<'a, T: UsbContext> Session<'a, T> {
 
 fn u32_at(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Data plane — REMOTE_NDIS_PACKET_MSG on the bulk endpoints.
+//
+// Wire format (little-endian):
+//   offset  field
+//        0  MessageType         0x00000001
+//        4  MessageLength       total including ethernet payload
+//        8  DataOffset          from start of this field to ethernet frame
+//       12  DataLength          ethernet frame byte count
+//       16  OOBDataOffset       unused (0)
+//       20  OOBDataLength       0
+//       24  NumOOBDataElements  0
+//       28  PerPacketInfoOffset 0
+//       32  PerPacketInfoLength 0
+//       36  DeviceVcHandle      0
+//       40  Reserved            0
+//       44  <ethernet frame>
+//
+// A single bulk transfer can carry multiple PACKET_MSGs back-to-back. Each
+// chunk is self-describing via MessageLength, so we walk until we run out
+// of bytes.
+
+pub const PACKET_HEADER_LEN: usize = 44;
+
+/// Wrap a raw ethernet frame in a PACKET_MSG. Returns bytes ready for bulk OUT.
+///
+/// MS-RNDIS §2.2.1 requires each message to be a multiple of 4 bytes.
+/// MessageLength in the header stays the unpadded value (matches Linux
+/// rndis_host behavior); trailing zero padding is just filler.
+pub fn encode_packet(frame: &[u8]) -> Vec<u8> {
+    let total = PACKET_HEADER_LEN + frame.len();
+    let padded = (total + 3) & !3;
+    let mut out = Vec::with_capacity(padded);
+    out.extend_from_slice(&MSG_PACKET.to_le_bytes()); //  0
+    out.extend_from_slice(&(total as u32).to_le_bytes()); //  4 MessageLength (unpadded)
+    out.extend_from_slice(&(PACKET_HEADER_LEN as u32 - 8).to_le_bytes()); //  8 DataOffset = 36
+    out.extend_from_slice(&(frame.len() as u32).to_le_bytes()); // 12 DataLength
+    out.extend_from_slice(&[0u8; PACKET_HEADER_LEN - 16]); // 16..44 all zero
+    out.extend_from_slice(frame);
+    out.resize(padded, 0);
+    out
+}
+
+/// Parse one or more PACKET_MSGs out of a bulk IN buffer. Non-PACKET messages
+/// (e.g. INDICATE_STATUS) are skipped with a log line, never fatal.
+pub fn decode_packets(buf: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut frames = Vec::new();
+    let mut pos = 0;
+    while pos + 8 <= buf.len() {
+        let msg_type = u32_at(buf, pos);
+        let msg_len = u32_at(buf, pos + 4) as usize;
+        if msg_len < 8 || pos + msg_len > buf.len() {
+            bail!(
+                "malformed RNDIS chunk at {}: type=0x{:08x} len={} (buf={})",
+                pos,
+                msg_type,
+                msg_len,
+                buf.len()
+            );
+        }
+        let chunk = &buf[pos..pos + msg_len];
+        if msg_type == MSG_PACKET {
+            if chunk.len() < PACKET_HEADER_LEN {
+                bail!("PACKET_MSG truncated: {} B", chunk.len());
+            }
+            let data_off = u32_at(chunk, 8) as usize;
+            let data_len = u32_at(chunk, 12) as usize;
+            let start = 8 + data_off;
+            let end = start
+                .checked_add(data_len)
+                .ok_or_else(|| anyhow!("PACKET_MSG length overflow"))?;
+            if end > chunk.len() {
+                bail!(
+                    "PACKET_MSG data out of range: start={}, len={}, chunk={}",
+                    start,
+                    data_len,
+                    chunk.len()
+                );
+            }
+            frames.push(chunk[start..end].to_vec());
+        } else {
+            // Non-PACKET control on the data pipe is unusual but harmless to
+            // ignore. Log to stderr in case it hints at a firmware quirk.
+            eprintln!(
+                "    ↯ skipped non-PACKET chunk on data pipe: type=0x{:08x} len={}",
+                msg_type, msg_len
+            );
+        }
+        pos += msg_len;
+    }
+    Ok(frames)
+}
+
+pub fn read_bulk_frames<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ep_in: u8,
+    timeout: Duration,
+) -> Result<Vec<Vec<u8>>> {
+    let mut buf = vec![0u8; 16 * 1024];
+    match handle.read_bulk(ep_in, &mut buf, timeout) {
+        Ok(n) if n > 0 => {
+            buf.truncate(n);
+            decode_packets(&buf)
+        }
+        Ok(_) => Ok(Vec::new()),
+        Err(rusb::Error::Timeout) => Ok(Vec::new()),
+        Err(e) => Err(anyhow!("bulk IN read failed: {}", e)),
+    }
+}
+
+pub fn write_bulk_frame<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ep_out: u8,
+    frame: &[u8],
+) -> Result<()> {
+    let msg = encode_packet(frame);
+    let n = handle
+        .write_bulk(ep_out, &msg, Duration::from_millis(1000))
+        .context("bulk OUT write")?;
+    if n != msg.len() {
+        bail!("short bulk write: {}/{}", n, msg.len());
+    }
+    Ok(())
 }
 
 pub fn format_mac(mac: &[u8]) -> String {
