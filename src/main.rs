@@ -266,10 +266,10 @@ fn cmd_dump() -> Result<()> {
             check, rndis::FILTER_NORMAL, readback_val
         );
 
-        // Clear any lingering endpoint halt state left behind by SET_FILTER
-        // quirks seen on non-Linux RNDIS gadgets. Free if unnecessary.
-        handle.clear_halt(ep_in).ok();
-        handle.clear_halt(ep_out).ok();
+        // NB: no pre-emptive clear_halt. On a healthy endpoint that call
+        // resets the data-toggle and causes the first bulk read to fail with
+        // IO error (confirmed on Redmi 14C). clear_halt is now done lazily
+        // inside read_bulk_frames only when an actual IO/Pipe error shows up.
 
         // Drain pending RESPONSE_AVAILABLE notifications on the interrupt IN
         // endpoint. MS-RNDIS warns that devices may buffer-exhaust and freeze
@@ -707,10 +707,18 @@ fn cmd_probe() -> Result<()> {
     let rb_val = if rb.len() == 4 { u32::from_le_bytes(rb.as_slice().try_into().unwrap()) } else { 0 };
     tee(&format!("  packet_filter set=0x{:08x} readback=0x{:08x} {}", rndis::FILTER_NORMAL, rb_val, if rb_val == rndis::FILTER_NORMAL {"✔"} else {"✗"}));
 
-    handle.clear_halt(ep_in).ok();
-    handle.clear_halt(ep_out).ok();
+    // Drain any control-plane notifications that accumulated during setup
+    // before we start the data plane. DO NOT pre-emptively clear_halt on the
+    // bulk endpoints — that actively desyncs a healthy endpoint's toggle
+    // state and produces an Io error on the next bulk read (confirmed with
+    // Redmi 14C). The bulk read path handles IO/Pipe errors with a lazy
+    // clear_halt only when they actually happen.
     let drained = rndis::drain_interrupt_notifications(&handle, ctrl_if, intr_ep)?;
     tee(&format!("  drained {} interrupt notifications from 0x{:02x}", drained, intr_ep));
+
+    // Give the device a moment to settle after SET filter before we start
+    // slamming bulk IN reads.
+    std::thread::sleep(Duration::from_millis(300));
 
     // ── Phase E — listen-only 15 s ───────────────────────────────────
     tee("\n━━━ PHASE E — listen only, no TX, 15 s ━━━");
